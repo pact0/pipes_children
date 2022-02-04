@@ -17,9 +17,11 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#define DEADCHILD -10
 typedef struct {
     char* path; // sciezka do pliki z danymi do pobrania
     long volume; // liczba danych do pobrania przez wzystkie podprocesy
+    long currentVolume; // liczba danych do pobrania przez wzystkie podprocesy w danym momencie
     long block; // liczba danych do pobrania przez jeden proces
     char* successPath; // sciezka na odnotowanie osiagniec
     char* logPath; // sciezka na logi
@@ -27,6 +29,8 @@ typedef struct {
 } Parameters;
 
 static Parameters parameters = {};
+int childrenCounter = 0;
+pid_t* pids = NULL;
 
 void Error(const char* errormsg){
     perror(errormsg);
@@ -67,116 +71,123 @@ void ParseParams(int argc, char * argv[]){
         switch (opt) {
             case 'd': //sciezka do danych
                 parameters.path = optarg;
-                printf("parameters.path %s\n", parameters.path);
                 break;
             case 's': //Ilosc danych jakie chcemmy zassac
                 parameters.volume = ParseParam(optarg);
-                printf("parameters.volume %ld\n", parameters.volume);
+                parameters.currentVolume = ParseParam(optarg);
                 break;
             case 'w': //Ilosc danych do zassania przez potomka
                 parameters.block = ParseParam(optarg);
-                printf("parameters.block %ld\n", parameters.block);
                 break;
             case 'f': // Sciezka do pliku z osiagnieciami
                 parameters.successPath = optarg;
-                printf("parameters.successPath %s\n", parameters.successPath);
                 break;
             case 'l':// sciezka do raportow o potomkack
                 parameters.logPath = optarg;
-                printf("parameters.logPath %s\n", parameters.logPath);
                 break;
             case 'p': // maksymalne ilosc potomkow
                 ret = strtol(optarg, &ptr, 10);
                 parameters.maxChildren = ret;
-                printf("parameters.maxChildren %d\n", parameters.maxChildren);
                 break;
             default:
                 Error("Error parsing arguments.\n");
         }
     }
 }
+int FindFreePIDSlot(pid_t* passedpids, pid_t pid){
+    for (int i = 0; i < parameters.maxChildren; ++i) {
+        if(passedpids[i] == DEADCHILD || passedpids[i] == 0){
+            passedpids[i] = pid;
+            ++childrenCounter;
+            return i;
+        }
+    }
+    return -1;
+}
+void HandleChildDeath(int signal){
+    pid_t p;
+    int status;
+
+    while ((p=waitpid(-1, &status, WNOHANG)) != -1)
+    {
+        for (int i = 0; i < parameters.maxChildren; ++i) {
+            if(pids[i] == p){
+                pids[i] = DEADCHILD;
+                --childrenCounter;
+            }
+        }
+    }
+}
 
 int main (int argc, char *argv[])
 {
-
     ParseParams(argc,argv);
-    char* poszukiwaczPath = "poszukiwacz";
-    int i = 0;
-    pid_t* pids = (pid_t*)calloc(sizeof(pid_t) * parameters.maxChildren, 1);
+    pids = (pid_t*)calloc(sizeof(pid_t) * parameters.maxChildren, 1);
+    sigaction(SIGCHLD, HandleChildDeath, NULL);
 
-    struct stat finfo;
-    int childrenCounter = 0;
+    int i = 0;
+    char* poszukiwaczPath = "/home/pacto/CLionProjects/untitled/cmake-build-debug/poszukiwacz";
 
     int readPipe[2];
     int writePipe[2];
 
-
-
-    Check(pipe(readPipe), "Couldn't create a read pipe\n");
     Check(pipe(writePipe), "Couldn't create a write pipe\n");
+    Check(pipe(readPipe), "Couldn't create a read pipe\n");
 
-    if (isatty(fileno(stdin)))
-        printf( "stdin is a terminal\n" );
-    else
-        printf( "stdin is a file or a pipe\n");
+    while((parameters.currentVolume > 0) && (childrenCounter < parameters.maxChildren)){
+        i  = FindFreePIDSlot(pids, fork());
+        Check(i, "Couldn't find a free slot for child.\n");
 
+        long childBlock = parameters.currentVolume - parameters.block > parameters.block ?
+                parameters.block :  parameters.currentVolume;
 
-    while(childrenCounter < 5){
-        pids[i] = fork();
-
-        printf("NUM VOLUME %ld.\n", parameters.volume - parameters.block);
         if (pids[i] == -1)
         {
             Error("Failed to fork.\n");
         }else if (pids[i] > 0)
         {
-            int status;
             printf("child born \n");
         }else {
             // we are the child
             char buff[5000];
-            sprintf(buff, "%ld", parameters.block);
-            char * args[3] = {"/home/pacto/CLionProjects/untitled1/cmake-build-debug/poszukiwacz", buff, NULL};
+            sprintf(buff, "%ld", childBlock);
+            char * args[3] = {poszukiwaczPath, buff, NULL};
 
-            printf("We are child \n");
-//            close(readPipe[1]);
-            Check(dup2(readPipe[0], fileno(stdin)), "Couldn't dup2 for readPipe\n");
+            Check(dup2(readPipe[1], STDOUT_FILENO), "Couldn't dup2 for readPipe\n");
             close(readPipe[0]);
+            close(readPipe[1]);
 
-//            close(writePipe[0]);
-            Check(dup2(writePipe[1], fileno(stdout)), "Couldn't dup2 for writePipe\n");
+            Check(dup2(writePipe[0], STDIN_FILENO), "Couldn't dup2 for writePipe\n");
+            close(writePipe[0]);
             close(writePipe[1]);
 
-            Check(execv("/home/pacto/CLionProjects/untitled1/cmake-build-debug/poszukiwacz", args), "Exec.\n");
+            Check(execv(poszukiwaczPath, args), "Exec.\n");
         }
-        long childBlock = parameters.volume - parameters.block > parameters.block ? parameters.block :  parameters.volume;
-        parameters.volume -= parameters.block;
-        ++childrenCounter;
-        ++i;
+        parameters.currentVolume -= childBlock;
     }
 
-    close(readPipe[1]);
     close(writePipe[0]);
+    close(readPipe[1]);
 
-    int filePath = open("/dev/urandom",O_RDONLY );
-
+    int filePath = open(parameters.path,O_RDONLY );
     Check(filePath, "Couldn't open file.\n");
 
-    const int dataRead = 1024;
-    char* dataReadFromFile= (char*)calloc(sizeof(char)*dataRead*2, 1);
-    Check(read(filePath, dataReadFromFile, 2*dataRead), "Couldn't read from source file.\n");
+    char* dataReadFromFile= (char*)calloc(sizeof(char)*2*parameters.block, 1);
+//    Check(read(filePath, dataReadFromFile, sizeof(char)*2*parameters.block)), "Couldn't read from source file.\n");
+    fprintf(stderr,"Data read from file %d",read(filePath, dataReadFromFile, sizeof(char)*2*parameters.block));
 
-    printf("Data read %d\n", *dataReadFromFile);
+    //Check(write(writePipe[1], dataReadFromFile, 2*dataRead), "Couldn't write to a pipe\n");
+    fprintf(stderr,"\n%d\n",write(writePipe[1], dataReadFromFile, sizeof(char)*2*parameters.block), "Couldn't write to a pipe\n");
 
+    char* dataReadFromChild = (char*)calloc(sizeof(char)*2*parameters.block, 1);
+    for (int j = 0; j < 10; ++j) {
+        fprintf(stderr,"Read from a child %d\n",read(readPipe[0], dataReadFromChild, 2), "Couldn't read from a pipe\n");
+        fprintf(stderr,"Read from a child %d\n", *dataReadFromChild);
+    }
 
-    Check(filePath, "Couldn't open file to read from.\n");
-    Check(write(writePipe[1], dataReadFromFile, 2*dataRead), "Couldn't write to a pipe\n");
-
-
-    char dataReadFromPipe[dataRead];
-    Check(read(readPipe[0], dataReadFromPipe,dataRead), "Couldn't write to a pipe\n");
-
-    printf("Data read from pipe %d\n", *dataReadFromPipe);
+    for (int j = 0; j < parameters.maxChildren; ++j) {
+        waitpid(pids[i], NULL, 0);
+    }
 
     return 0;
 }
