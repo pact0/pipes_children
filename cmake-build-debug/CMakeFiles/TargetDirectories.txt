@@ -1,0 +1,4 @@
+/home/pacto/CLionProjects/untitled1/cmake-build-debug/CMakeFiles/edit_cache.dir
+/home/pacto/CLionProjects/untitled1/cmake-build-debug/CMakeFiles/rebuild_cache.dir
+/home/pacto/CLionProjects/untitled1/cmake-build-debug/CMakeFiles/kolekcjoner.dir
+/home/pacto/CLionProjects/untitled1/cmake-build-debug/CMakeFiles/poszukiwacz.dir
