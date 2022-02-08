@@ -138,7 +138,7 @@ void prepareFile(int fileDescriptor)
 void create_child()
 {
     int i = 0;
-    char* poszukiwaczPath = "/home/pacto/CLionProjects/untitled/cmake-build-debug/poszukiwacz";
+    char* poszukiwaczPath = "./poszukiwacz";
 
     while((parameters.currentVolume > 0) && (childrenCounter < parameters.maxChildren)){
         i  = FindFreePIDSlot(pids, fork());
@@ -187,8 +187,8 @@ int main (int argc, char *argv[])
 
     ParseParams(argc,argv);
 
-    logs = open(parameters.logPath, O_TRUNC | O_WRONLY, S_IRWXU);
-    int table = open(parameters.successPath, O_TRUNC | O_RDWR, S_IRWXU);
+    logs = open(parameters.logPath, O_CREAT| O_TRUNC | O_WRONLY, S_IRWXU);
+    int table = open(parameters.successPath,  O_CREAT| O_TRUNC | O_RDWR, S_IRWXU);
 
     Check(logs, "Could not open logs file\n");
     Check(table, "Could not open logs file\n");
