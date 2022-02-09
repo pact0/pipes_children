@@ -58,11 +58,11 @@ int main(int argc, char *argv[]) {
     return returnValue;
 }
 
-
 void Error(const char *errormsg) {
     perror(errormsg);
     exit(EXIT_FAIL);
 }
+
 void Check(int value, const char *errormsg) {
     if (value == -1)
         Error(errormsg);
@@ -85,7 +85,6 @@ void CheckProgramArgumentSize(int argc, char *argv[]) {
     }
 }
 
-
 long ParseUnit(const char *unit) {
     if (strcmp(unit, "Ki") == 0) {
         return 1024;
@@ -105,12 +104,11 @@ long ParseParam(const char *param) {
     Check(unit, "Passed in wrong unit to the arguments.\n");
 
     long result = ret * unit;
-    if(result < 0){
+    if (result < 0) {
         Error("Argument is not a positive number.\n");
     }
-    return  result;
+    return result;
 }
-
 
 uint16_t GetNumberFromInput(int fd) {
     uint16_t data;
@@ -130,8 +128,8 @@ int CheckIfExistsInArray(const uint16_t *Numbers, int size, short num) {
 
 void InitProgramData(const char *param) {
     const unsigned long dataToRead = ParseParam(param);
-    uint16_t* allNumbers = (uint16_t *) calloc(dataToRead * 2, 1);
-    if(allNumbers == NULL){
+    uint16_t *allNumbers = (uint16_t *) calloc(dataToRead * 2, 1);
+    if (allNumbers == NULL) {
         Error("Couldn't allocate allNumbers array.\n");
     }
 

@@ -11,7 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DEBUG_ON
+//#define DEBUG_ON
 // debug which takes any arguments which then get passed to fprintf
 #ifdef DEBUG_ON
 #define Debug(x, ...) fprintf(stderr, x, __VA_ARGS__)
@@ -150,7 +150,7 @@ int main(int argc, char *argv[]) {
         if (communicationData.childCounter <= 0 && dataRead <= 0) break;
         if (dataRead <= 0) continue;
 
-        Debug("Records read %ld\tData read: %d\tReceived data: NUmber %hu, PID %d.\n", communicationData.recordCounter, dataRead, receivedMessage.number, receivedMessage.pid);
+        Debug("Records read %ld\tData read: %d\tReceived data: Number %hu, PID %d.\n", communicationData.recordCounter, dataRead, receivedMessage.number, receivedMessage.pid);
 
         WriteToSuccessFile(receivedMessage);
 
@@ -184,10 +184,10 @@ long ParseParam(const char *param) {
     Check(unit, "Passed in wrong unit to the arguments.\n");
 
     long result = ret * unit;
-    if(result < 0){
+    if (result < 0) {
         Error("Argument is not a positive number.\n");
     }
-    return  result;
+    return result;
 }
 
 void Error(const char *errormsg) {
@@ -263,7 +263,7 @@ void CreateChildren() {
             LogBirth(programData.pids[i]);
         } else {
             char buff[32];
-            if(sprintf(buff, "%ld", childBlock) < 0){
+            if (sprintf(buff, "%ld", childBlock) < 0) {
                 Error("Couldn't format string with sprintf.\n");
             }
             char *args[3] = {POSZUKIWACZ_PATH, buff, NULL};
@@ -290,7 +290,7 @@ void FillSuccessesFile(int fileDescriptor) {
 }
 void HandlePipes() {
     programData.pids = (pid_t *) calloc(sizeof(pid_t) * parameters.maxChildren, 1);
-    if(programData.pids == NULL){
+    if (programData.pids == NULL) {
         Error("Couldn't allocate pids array.\n");
     }
 
@@ -322,14 +322,14 @@ void InitProgram(int argc, char *argv[]) {
 }
 void WriteToSuccessFile(Record receivedMessage) {
     pid_t recordInFile;
-    Check(lseek(programFiles.successes, sizeof(pid_t) * receivedMessage.number, SEEK_SET),"Couldn't lseek in success file.\n");
+    Check(lseek(programFiles.successes, sizeof(pid_t) * receivedMessage.number, SEEK_SET), "Couldn't lseek in success file.\n");
 
     int countRecordInFile = read(programFiles.successes, &recordInFile, sizeof(pid_t));
     Check(countRecordInFile, "Couldn't read from a log file.");
 
     if (recordInFile == 0) {
-        Check(lseek(programFiles.successes, sizeof(pid_t) * receivedMessage.number, SEEK_SET),"Couldn't lseek in success file.\n");
-        Check(write(programFiles.successes, &receivedMessage.pid, sizeof(pid_t)),"Couldn't write to success file.\n");
+        Check(lseek(programFiles.successes, sizeof(pid_t) * receivedMessage.number, SEEK_SET), "Couldn't lseek in success file.\n");
+        Check(write(programFiles.successes, &receivedMessage.pid, sizeof(pid_t)), "Couldn't write to success file.\n");
         communicationData.recordCounter++;
     }
 }
@@ -355,7 +355,7 @@ void LogDeath(int deathStatus, pid_t p) {
     char logMessage[200];
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    if(sprintf(logMessage, "[Time: %ld] Child died. PID: %d, Job status: %d\n", start.tv_sec, p, deathStatus)<0){
+    if (sprintf(logMessage, "[Time: %ld] Child died. PID: %d, Job status: %d\n", start.tv_sec, p, deathStatus) < 0) {
         Error("Couldn't format string with sprintf.\n");
     }
     Check(write(programFiles.logs, logMessage, strlen(logMessage)), "Couldn't write to log file.\n");
@@ -364,7 +364,7 @@ void LogBirth(pid_t pid) {
     char logMessage[100] = {};
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    if(sprintf(logMessage, "[Time: %ld] Child born. PID: %d\n", start.tv_sec, pid)<0){
+    if (sprintf(logMessage, "[Time: %ld] Child born. PID: %d\n", start.tv_sec, pid) < 0) {
         Error("Couldn't format string with sprintf.\n");
     }
     Check(write(programFiles.logs, logMessage, strlen(logMessage)), "Couldn't write to a log file.\n");
@@ -375,7 +375,7 @@ void CheckFileOverflow() {
         createMoreChildren = 0;
     }
 }
-void CheckChildStatus(){
+void CheckChildStatus() {
     pid_t p = 0;
     int status = 0;
 
@@ -393,7 +393,7 @@ void CheckChildStatus(){
                 if (WIFEXITED(status)) {
                     int deathStatus = WEXITSTATUS(status);
                     Debug("Child with PID: %d just died with status %d.\n", p, deathStatus);
-                    if(deathStatus > 10){
+                    if (deathStatus > 10) {
                         Error("Child returned with error status (>10).\n");
                     }
                     LogDeath(deathStatus, p);
