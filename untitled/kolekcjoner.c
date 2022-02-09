@@ -1,110 +1,235 @@
 #include <errno.h>
+#include <fcntl.h>
+#include <linux/limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/poll.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/timerfd.h>
-#include <arpa/inet.h>
-#include <memory.h>
-#include <fcntl.h>
-#include <netinet/in.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/stat.h>
-#include <linux/limits.h>
 
-#define NANOSEC 1000000000L
-#define FL2NANOSEC(f) {(long)(f), ((f)-(long)(f))*NANOSEC}
+#define DEBUG_ON
+// debug which takes any arguments which then get passed to fprintf
+#ifdef DEBUG_ON
+#define Debug(x, ...) fprintf(stderr, x, __VA_ARGS__)
+#else
+#define Debug(x, ...)
+#endif
 
-int DELAY = 0;
-int ISNOTREADING = 0;
-int NOTHINGDIED = 0;
-
+#define POSZUKIWACZ_PATH "./poszukiwacz"
+#define RECORDS 65535
 #define DEADCHILD -10
+
+// taken from class notes
+#define NANOSEC 1000000000L
+#define FL2NANOSEC(f) \
+    { (long) (f), ((f) - (long) (f)) * NANOSEC }
+
+int IS_NOT_READING = 0;
+int NOTHING_DIED = 0;
+int createMoreChildren = 1;
+
 typedef struct {
-    char* path; // sciezka do pliki z danymi do pobrania
-    long volume; // liczba danych do pobrania przez wzystkie podprocesy
-    long currentVolume; // liczba danych do pobrania przez wzystkie podprocesy w danym momencie
-    long block; // liczba danych do pobrania przez jeden proces
-    char* successPath; // sciezka na odnotowanie osiagniec
-    char* logPath; // sciezka na logi
-    int maxChildren; // maksymalna liczba potomkow
+    char *path;        // path to source file
+    long volume;       // amount of data to read total
+    long currentVolume;// data collected so far
+    long block;        // amount of data to be read by a single "poszukiwacz"
+    char *successPath; // path to log successful finds
+    char *logPath;     // path to log logs
+    int maxChildren;   // maximum number of "poszukiwacz" processes at once
 } Parameters;
 
 typedef struct {
-    short number;
+    uint16_t number;
     pid_t pid;
-}Record;
+} Record;
 
+typedef struct {
+    int readPipe[2];
+    int writePipe[2];
 
-int isRunning = 1;
-static Parameters parameters = {};
-int childrenCounter = 0;
-pid_t* pids = NULL;
-int logs;
-unsigned long wiadomosci=0;
-int readPipe[2];
-int writePipe[2];
+    pid_t *pids;
+} ProgramData;
 
-void Error(const char* errormsg){
+typedef struct {
+    int logs;
+    int successes;
+    int sourceFile;
+} ProgramFiles;
+
+typedef struct {
+    unsigned long messageCounter;
+    unsigned long childCounter;
+    unsigned long dataReceived;
+    unsigned long recordCounter;
+} CommunicationData;
+
+// Creating only one instance globally since I don't want to keep passing
+// values underneath as arguments
+Parameters parameters = {};
+ProgramData programData = {};
+ProgramFiles programFiles = {};
+CommunicationData communicationData = {};
+
+void Error(const char *errormsg);
+void Check(int value, const char *errormsg);
+
+long ParseUnit(const char *unit);
+long ParseParam(const char *param);
+
+void ParseParams(int argc, char *argv[]);
+int FindFreePIDSlot(pid_t *pids, pid_t pid);
+
+void FillSuccessesFile(int fileDescriptor);
+
+void HandleFiles();
+void HandlePipes();
+void CloseAll();
+
+void InitProgram(int argc, char *argv[]);
+
+void CreateChildren();
+void ConditionalDelay(int condition, double time);
+
+void LogDeath(int deathStatus, pid_t p);
+void LogBirth(pid_t pid);
+
+void WriteToSuccessFile(Record receivedMessage);
+void CheckFileOverflow();// Checks if 75% of records in file are filled if yes it flips a flag to stop creating children
+void CheckChildStatus();
+
+int main(int argc, char *argv[]) {
+    InitProgram(argc, argv);
+
+    CreateChildren();
+
+    char *dataReadFromFile = (char *) calloc(sizeof(uint16_t) * parameters.volume, 1);
+    int bytesReadFromFile = read(programFiles.sourceFile, dataReadFromFile, sizeof(uint16_t) * parameters.volume);
+
+    Check(bytesReadFromFile, "Couldn't read from source file.\n");
+    Debug("Bytes read from source file %d.\n", bytesReadFromFile);
+
+    Record receivedMessage = {};
+    unsigned long dataWritten = 0;
+    unsigned long allData = parameters.volume * 2;
+
+    while (1) {
+        ConditionalDelay(IS_NOT_READING & NOTHING_DIED, 0.48);
+
+        CheckChildStatus();
+
+        if (dataWritten < parameters.volume * 2) {
+            // Check free space in pipe buff
+            long toSend = allData < PIPE_BUF ? allData : PIPE_BUF;
+            int takenSizeInPipe = 0;
+            Check(ioctl(programData.writePipe[1], FIONREAD, &takenSizeInPipe), "Couldn't check pipe size.\n");
+            // Subtract from the pipe's max size to avoid overflow problems
+            if (takenSizeInPipe + toSend < 65536 - 10000) {
+                // Only send PIPE_BUF or less data to keep data atomic
+                int w = write(programData.writePipe[1], dataReadFromFile + dataWritten, toSend);
+                if (w >= 0) {
+                    dataWritten += w;
+                    allData -= w;
+                }
+                Check(w, "Couldn't write to a pipe.\n");
+            }
+        }
+
+        int dataRead = read(programData.readPipe[0], &receivedMessage, sizeof(Record));
+
+        if (dataRead == -1) {
+            IS_NOT_READING = 1;
+        } else {
+            communicationData.dataReceived += dataRead;
+            IS_NOT_READING = 0;
+        }
+
+        if (communicationData.childCounter <= 0 && dataRead <= 0) break;
+        if (dataRead <= 0) continue;
+
+        Debug("Records read %ld\tData read: %d\tReceived data: NUmber %hu, PID %d.\n", communicationData.recordCounter, dataRead, receivedMessage.number, receivedMessage.pid);
+
+        WriteToSuccessFile(receivedMessage);
+
+        CheckFileOverflow();
+
+        Debug("Currently have %lu running processes.\n", communicationData.childCounter);
+    }
+
+    Debug("Total data received %lu.\n", communicationData.dataReceived);
+    free(dataReadFromFile);
+    CloseAll();
+    return EXIT_SUCCESS;
+}
+
+long ParseUnit(const char *unit) {
+    if (strcmp(unit, "Ki") == 0) {
+        return 1024;
+    } else if (strcmp(unit, "Mi") == 0) {
+        return 1024 * 1024;
+    } else if (strcmp(unit, "") == 0) {
+        return 1;
+    }
+    return -1;
+}
+
+long ParseParam(const char *param) {
+    char *ptr;
+
+    long ret = strtol(param, &ptr, 10);
+    long unit = ParseUnit(ptr);
+    Check(unit, "Passed in wrong unit to the arguments.\n");
+
+    long result = ret * unit;
+    if(result < 0){
+        Error("Argument is not a positive number.\n");
+    }
+    return  result;
+}
+
+void Error(const char *errormsg) {
     perror(errormsg);
     exit(EXIT_FAILURE);
 }
 
-long ParseUnit(const char* unit){
-    if (strcmp(unit, "Ki") == 0) {
-        return 1024;
-    } else if (strcmp(unit, "Mi") == 0){
-        return 1024 * 1024;
-    }
-    return 1;
-}
-
-long ParseParam(const char* param){
-    char *ptr;
-    long ret;
-
-    ret = strtol(param, &ptr, 10);
-    return ret * ParseUnit(ptr);
-}
-
-void Check(int value, const char * errormsg){
+void Check(int value, const char *errormsg) {
     if (value == -1)
         Error(errormsg);
 }
 
-void ParseParams(int argc, char * argv[]){
-    if (argv == NULL){
-        fprintf(stderr, "ParseParameters(): argv is NULL\n");
-        exit(1);
+void ParseParams(int argc, char *argv[]) {
+    if (argv == NULL) {
+        Error("argv is NULL.\n");
     }
+    if (argc < 7) {
+        Error("Too few arguments passed.\n");
+    }
+
     int opt;
     char *ptr;
     long ret;
     while ((opt = getopt(argc, argv, "d:s:w:f:l:p:")) != -1) {
         switch (opt) {
-            case 'd': //sciezka do danych
+            case 'd':
                 parameters.path = optarg;
                 break;
-            case 's': //Ilosc danych jakie chcemmy zassac
+            case 's':
                 parameters.volume = ParseParam(optarg);
-                parameters.currentVolume = ParseParam(optarg);
+                parameters.currentVolume = parameters.volume;
                 break;
-            case 'w': //Ilosc danych do zassania przez potomka
+            case 'w':
                 parameters.block = ParseParam(optarg);
                 break;
-            case 'f': // Sciezka do pliku z osiagnieciami
+            case 'f':
                 parameters.successPath = optarg;
                 break;
-            case 'l':// sciezka do raportow o potomkack
+            case 'l':
                 parameters.logPath = optarg;
                 break;
-            case 'p': // maksymalne ilosc potomkow
+            case 'p':
                 ret = strtol(optarg, &ptr, 10);
                 parameters.maxChildren = ret;
                 break;
@@ -113,214 +238,173 @@ void ParseParams(int argc, char * argv[]){
         }
     }
 }
-int FindFreePIDSlot(pid_t* passedpids, pid_t pid){
+
+int FindFreePIDSlot(pid_t *pids, pid_t pid) {
     for (int i = 0; i < parameters.maxChildren; ++i) {
-        if(passedpids[i] == DEADCHILD || passedpids[i] == 0){
-            passedpids[i] = pid;
-            ++childrenCounter;
+        if (pids[i] == DEADCHILD || pids[i] == 0) {
+            pids[i] = pid;
+            ++communicationData.childCounter;
             return i;
         }
     }
     return -1;
 }
+void CreateChildren() {
+    while ((parameters.currentVolume > 0) && (communicationData.childCounter < parameters.maxChildren)) {
+        int i = FindFreePIDSlot(programData.pids, fork());
+        Check(i, "Couldn't find a free slot for a child.\n");
 
-void prepareFile(int fileDescriptor)
-{
-    pid_t str=0;
+        long childBlock = parameters.currentVolume > parameters.block ? parameters.block : parameters.currentVolume;
 
-    int recordNumber = 65535;
+        Check(programData.pids[i], "Couldn't create fork.\n");
 
-    for (int i = 0; i < recordNumber ; ++i) {
-        write(fileDescriptor,&str,sizeof(pid_t));
-    }
-}
+        if (programData.pids[i] > 0) {
+            Debug("Child born with PID: %d\n", programData.pids[i]);
+            LogBirth(programData.pids[i]);
+        } else {
+            char buff[32];
+            if(sprintf(buff, "%ld", childBlock) < 0){
+                Error("Couldn't format string with sprintf.\n");
+            }
+            char *args[3] = {POSZUKIWACZ_PATH, buff, NULL};
 
-void create_child()
-{
-    int i = 0;
-    char* poszukiwaczPath = "./poszukiwacz";
+            Check(dup2(programData.readPipe[1], STDOUT_FILENO), "Couldn't dup2 for readPipe\n");
+            close(programData.readPipe[0]);
+            close(programData.readPipe[1]);
 
-    while((parameters.currentVolume > 0) && (childrenCounter < parameters.maxChildren)){
-        i  = FindFreePIDSlot(pids, fork());
-        Check(i, "Couldn't find a free slot for child.\n");
+            Check(dup2(programData.writePipe[0], STDIN_FILENO), "Couldn't dup2 for writePipe\n");
+            close(programData.writePipe[0]);
+            close(programData.writePipe[1]);
 
-        long childBlock = parameters.currentVolume > parameters.block ?
-                          parameters.block :  parameters.currentVolume;
-
-        if (pids[i] == -1)
-        {
-            Error("Failed to fork.\n");
-        }else if (pids[i] > 0)
-        {
-            printf("child born \n");
-            char logMessage[100]={};
-            struct timespec start;
-            clock_gettime(CLOCK_MONOTONIC, &start);
-            sprintf(logMessage, "Time: %d, Info: child created. PID: %d\n",start.tv_sec , pids[i]);
-            write(logs, logMessage, strlen(logMessage));
-        }else {
-            // we are the child
-            char* logMsg = "New child born, PID: \n";
-            char buff[5000];
-            sprintf(buff, "%ld", childBlock);
-            char * args[3] = {poszukiwaczPath, buff, NULL};
-
-            Check(dup2(readPipe[1], STDOUT_FILENO), "Couldn't dup2 for readPipe\n");
-            close(readPipe[0]);
-            close(readPipe[1]);
-
-            Check(dup2(writePipe[0], STDIN_FILENO), "Couldn't dup2 for writePipe\n");
-            close(writePipe[0]);
-            close(writePipe[1]);
-
-            Check(execv(poszukiwaczPath, args), "Exec.\n");
+            Check(execv(POSZUKIWACZ_PATH, args), "Error when doing exec.\n");
         }
         parameters.currentVolume -= childBlock;
     }
 }
 
-int main (int argc, char *argv[])
-{
-
-    struct timespec sleep_tm = FL2NANOSEC(2.0);
-
-
-    ParseParams(argc,argv);
-
-    logs = open(parameters.logPath, O_CREAT| O_TRUNC | O_WRONLY, S_IRWXU);
-    int table = open(parameters.successPath,  O_CREAT| O_TRUNC | O_RDWR, S_IRWXU);
-
-    Check(logs, "Could not open logs file\n");
-    Check(table, "Could not open logs file\n");
-    prepareFile(table);
-    pids = (pid_t*)calloc(sizeof(pid_t) * parameters.maxChildren, 1);
-    fprintf(stderr,"Rodzic pid: %d\n", getpid());
-    int i = 0;
-
-    Check(pipe(writePipe), "Couldn't create a write pipe\n");
-    Check(pipe(readPipe), "Couldn't create a read pipe\n");
-
-    int flags;
-    flags= fcntl(readPipe[0], F_GETFL);
-    flags |= O_NONBLOCK;
-    fcntl(readPipe[0], F_SETFL, flags);
-
-    create_child();
-
-    int filePath = open(parameters.path,O_RDONLY );
-    Check(filePath, "Couldn't open file.\n");
-
-    char* dataReadFromFile= (char*)calloc(sizeof(char)*2*parameters.volume, 1);
-//    Check(read(filePath, dataReadFromFile, sizeof(char)*2*parameters.block)), "Couldn't read from source file.\n");
-    fprintf(stderr,"Data read from file %d",read(filePath, dataReadFromFile, sizeof(char)*2*parameters.volume));
-
-    //Check(write(writePipe[1], dataReadFromFile, 2*dataRead), "Couldn't write to a pipe\n");
-
-    Record receivedMsg = {};
-    unsigned long dataWritten;
-    unsigned long allData = parameters.volume*2;
-
-    while(1)
-    {
-        pid_t p;
-        int status;
-
-        while ((p=waitpid(-1, &status, WNOHANG)))
-        {
-
-            if(p==-1){
-                NOTHINGDIED = 1;
-                break;
-            }else{
-                NOTHINGDIED = 0;
-            }
-            for (int i = 0; i < parameters.maxChildren; ++i) {
-                if(pids[i] == p){
-                    pids[i] = DEADCHILD;
-                    if ( WIFEXITED(status) ) {
-                        int es = WEXITSTATUS(status);
-                        fprintf(stderr,"[rodzic] After death: %d pid: %d\n",es,p);
-                        char logMessage[200];
-                        struct timespec start;
-                        clock_gettime(CLOCK_MONOTONIC, &start);
-                        sprintf(logMessage, "Time: %d, Info: child died ;(. PID: %d job status %d\n",start.tv_sec , p, es);
-                        write(logs, logMessage, strlen(logMessage));
-
-                        --childrenCounter;
-                        if(!isRunning){
-                            continue;
-                        }
-                        create_child();
-                    }
-                }
-            }
-        }
-
-
-        DELAY = ISNOTREADING && NOTHINGDIED;
-
-        if(DELAY){
-            nanosleep(&sleep_tm, NULL);
-        }
-
-        if(dataWritten < parameters.volume*2){
-            long toSend = allData < PIPE_BUF ? allData : PIPE_BUF;
-            int takenSizeInPipe = 0;
-            ioctl(writePipe[1], FIONREAD,&takenSizeInPipe);
-            if(takenSizeInPipe + toSend < 65536 - 10000){
-                int w = write(writePipe[1], dataReadFromFile+dataWritten, toSend);
-                if(w >= 0){
-                    dataWritten += w;
-                    fprintf(stderr,"\nData written %d toSend %d taken space %d\n",dataWritten,toSend, takenSizeInPipe);
-                    allData -= toSend;
-                }
-                fprintf(stderr,"ERRNO %d\n", errno);
-                Check(w, "Couldnt write t to pipe.\n");
-            }
-
-        }
-
-        int dataRead = read(readPipe[0], &receivedMsg, sizeof(Record));
-
-        if(dataRead == -1){
-            ISNOTREADING = 1;
-        }else{
-            ISNOTREADING = 0;
-        }
-
-        if(childrenCounter <= 0 && dataRead <= 0)break;
-        if(dataRead <= 0 ) continue;
-
-        fprintf(stderr,"Licznik rekordow %ld Odczytano: %d tresc liczba: %hu pid: %d\n",wiadomosci,dataRead,receivedMsg.number,receivedMsg.pid);
-
-        pid_t recordInFile;
-        lseek(table, sizeof(pid_t)*receivedMsg.number, SEEK_SET);
-
-        int countRecordInFile = read(table, &recordInFile,sizeof(pid_t));
-        Check(countRecordInFile, "Couldn't read from a log file.");
-
-        if(recordInFile==0){
-            lseek(table, sizeof(pid_t)*receivedMsg.number, SEEK_SET);
-            write(table, &receivedMsg.pid, sizeof(pid_t));
-            wiadomosci++;
-        }
-
-        if(wiadomosci/(double)65535 > 0.75){
-            isRunning = 0;
-        }
-
-
-        fprintf(stderr,"Zywe dzieci: %d\n",childrenCounter);
+void FillSuccessesFile(int fileDescriptor) {
+    pid_t str = 0;
+    for (size_t i = 0; i < RECORDS; ++i) {
+        Check(write(fileDescriptor, &str, sizeof(pid_t)), "Couldn't write to success file.\n");
+    }
+}
+void HandlePipes() {
+    programData.pids = (pid_t *) calloc(sizeof(pid_t) * parameters.maxChildren, 1);
+    if(programData.pids == NULL){
+        Error("Couldn't allocate pids array.\n");
     }
 
+    Check(pipe(programData.writePipe), "Couldn't create a write pipe\n");
+    Check(pipe(programData.readPipe), "Couldn't create a read pipe\n");
 
-
-    free(dataReadFromFile);
-    close(logs);
-    close(writePipe[0]);
-    close(writePipe[1]);
-    close(readPipe[0]);
-    close(readPipe[1]);
-    return 0;
+    // taken from The Linux Programming Interface
+    int flags = fcntl(programData.readPipe[0], F_GETFL);
+    flags |= O_NONBLOCK;
+    Check(fcntl(programData.readPipe[0], F_SETFL, flags), "Couldn't set readPipe[0] to nonblocking.\n");
 }
 
+void HandleFiles() {
+    programFiles.logs = open(parameters.logPath, O_CREAT | O_TRUNC | O_WRONLY, S_IRWXU);
+    programFiles.successes = open(parameters.successPath, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU);
+    programFiles.sourceFile = open(parameters.path, O_RDONLY);
+
+    Check(programFiles.logs, "Could not open/create logs file\n");
+    Check(programFiles.successes, "Could not open/create successes file\n");
+    Check(programFiles.sourceFile, "Couldn't open source file.\n");
+
+    FillSuccessesFile(programFiles.successes);
+}
+void InitProgram(int argc, char *argv[]) {
+    ParseParams(argc, argv);
+
+    HandleFiles();
+    HandlePipes();
+}
+void WriteToSuccessFile(Record receivedMessage) {
+    pid_t recordInFile;
+    Check(lseek(programFiles.successes, sizeof(pid_t) * receivedMessage.number, SEEK_SET),"Couldn't lseek in success file.\n");
+
+    int countRecordInFile = read(programFiles.successes, &recordInFile, sizeof(pid_t));
+    Check(countRecordInFile, "Couldn't read from a log file.");
+
+    if (recordInFile == 0) {
+        Check(lseek(programFiles.successes, sizeof(pid_t) * receivedMessage.number, SEEK_SET),"Couldn't lseek in success file.\n");
+        Check(write(programFiles.successes, &receivedMessage.pid, sizeof(pid_t)),"Couldn't write to success file.\n");
+        communicationData.recordCounter++;
+    }
+}
+
+void ConditionalDelay(int condition, double timeInSec) {
+    if (condition) {
+        struct timespec sleep_tm = FL2NANOSEC(timeInSec);
+        Check(nanosleep(&sleep_tm, NULL), "Couldn't nanosleep.\n");
+    }
+}
+
+void CloseAll() {
+    close(programFiles.logs);
+    close(programFiles.successes);
+    close(programFiles.sourceFile);
+    close(programData.writePipe[0]);
+    close(programData.writePipe[1]);
+    close(programData.readPipe[0]);
+    close(programData.readPipe[1]);
+}
+
+void LogDeath(int deathStatus, pid_t p) {
+    char logMessage[200];
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    if(sprintf(logMessage, "[Time: %ld] Child died. PID: %d, Job status: %d\n", start.tv_sec, p, deathStatus)<0){
+        Error("Couldn't format string with sprintf.\n");
+    }
+    Check(write(programFiles.logs, logMessage, strlen(logMessage)), "Couldn't write to log file.\n");
+}
+void LogBirth(pid_t pid) {
+    char logMessage[100] = {};
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    if(sprintf(logMessage, "[Time: %ld] Child born. PID: %d\n", start.tv_sec, pid)<0){
+        Error("Couldn't format string with sprintf.\n");
+    }
+    Check(write(programFiles.logs, logMessage, strlen(logMessage)), "Couldn't write to a log file.\n");
+}
+
+void CheckFileOverflow() {
+    if ((communicationData.recordCounter / (double) 65535) > 0.75) {
+        createMoreChildren = 0;
+    }
+}
+void CheckChildStatus(){
+    pid_t p = 0;
+    int status = 0;
+
+    while ((p = waitpid(-1, &status, WNOHANG))) {
+
+        if (p == -1) {
+            NOTHING_DIED = 1;
+            break;
+        } else {
+            NOTHING_DIED = 0;
+        }
+        for (int i = 0; i < parameters.maxChildren; ++i) {
+            if (programData.pids[i] == p) {
+                programData.pids[i] = DEADCHILD;
+                if (WIFEXITED(status)) {
+                    int deathStatus = WEXITSTATUS(status);
+                    Debug("Child with PID: %d just died with status %d.\n", p, deathStatus);
+                    if(deathStatus > 10){
+                        Error("Child returned with error status (>10).\n");
+                    }
+                    LogDeath(deathStatus, p);
+
+                    --communicationData.childCounter;
+
+                    if (!createMoreChildren) continue;
+
+                    CreateChildren();
+                }
+            }
+        }
+    }
+}
