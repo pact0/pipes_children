@@ -291,10 +291,7 @@ void CreateChildren() {
 }
 
 void FillSuccessesFile(int fileDescriptor) {
-    pid_t str = 0;
-    for (size_t i = 0; i < RECORDS; ++i) {
-        Check(write(fileDescriptor, &str, sizeof(pid_t)), "Couldn't write to success file.\n");
-    }
+    Check(ftruncate(fileDescriptor, sizeof(pid_t)*RECORDS),"Couldn't fill the success file.\n");
 }
 void HandlePipes() {
     programData.pids = (pid_t *) calloc(sizeof(pid_t) * parameters.maxChildren, 1);
@@ -312,8 +309,8 @@ void HandlePipes() {
 }
 
 void HandleFiles() {
-    programFiles.logs = open(parameters.logPath, O_CREAT | O_TRUNC | O_WRONLY, S_IRWXU);
-    programFiles.successes = open(parameters.successPath, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU);
+    programFiles.logs = open(parameters.logPath, O_CREAT | O_TRUNC | O_WRONLY, S_IWRITE | S_IREAD);
+    programFiles.successes = open(parameters.successPath, O_CREAT | O_TRUNC | O_RDWR, S_IWRITE | S_IREAD);
     programFiles.sourceFile = open(parameters.path, O_RDONLY);
 
     Check(programFiles.logs, "Could not open/create logs file\n");
